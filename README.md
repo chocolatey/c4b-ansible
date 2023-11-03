@@ -22,7 +22,6 @@ You should provide the following arguments:
 | license_path               | Your Chocolatey for Business license file.         |
 | certificate_path           | The PFX certificate to use for all HTTPS services. |
 | certificate_password       | The password for the PFX certificate.              |
-| database_connection_string | Optional: Provides an existing database to use.    |
 
 Finally, you can deploy the playbook as follows (using the example hosts file):
 

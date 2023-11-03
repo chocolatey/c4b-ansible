@@ -17,9 +17,6 @@
       prompt: What is the password to your Certificate file?
       private: true
       unsafe: true
-
-    - name: database_connection_string
-      prompt: If you already have a database, please provide the connection string. Otherwise hit enter without entering anything.
   tasks:
     - name: Ensure credentials Directory
       ansible.builtin.file:
