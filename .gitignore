@@ -1,0 +1,8 @@
+/credentials
+/files/download/
+/files/*.nupkg
+/files/*.zip
+__pycache__
+chocolatey.license.xml
+*.pfx
+*.nupkg

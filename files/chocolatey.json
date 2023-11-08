@@ -1,0 +1,32 @@
+{
+    "packages": [
+        { "name": "KB2919442", "version": "1.0.20160915", "internalize": false },
+        { "name": "KB2919355", "version": "1.0.20160915", "internalize": false },
+        { "name": "chocolatey" },
+        { "name": "chocolatey-agent" },
+        { "name": "chocolatey.extension" },
+        { "name": "chocolateygui" },
+        { "name": "chocolateygui.extension" },
+        { "name": "chocolatey-management-database" },
+        { "name": "chocolatey-management-service" },
+        { "name": "chocolatey-management-web" },
+        { "name": "chocolatey-licensed-jenkins-scripts" },
+        { "name": "dotnet-aspnetcoremodule-v2", "version": "16.0.23237" },
+        { "name": "dotnet-6.0-runtime", "version": "6.0.22" },
+        { "name": "dotnet-6.0-aspnetruntime", "version": "6.0.22" },
+        { "name": "nexus-repository" },
+        { "name": "jenkins" },
+        { "name": "temurin11jre", "version": "11.0.21.900" },
+        { "name": "dotnet4.5.2", "args": ["--no-progress --force --internalize-all-urls --append-use-original-location"] },
+        { "name": "nexushell" },
+        { "name": "sql-server-express" },
+        { "name": "dbatools" },
+        { "name": "dbatools-library.powershell" }
+    ],
+    "nexus_server": [
+        "files/chocolatey.2.2.2.nupkg",
+        "files/chocolatey.extension.6.1.0.nupkg",
+        "files/nexus-repository.3.60.0.2.nupkg",
+        "files/NexuShell.1.0.0.nupkg"
+    ]
+}

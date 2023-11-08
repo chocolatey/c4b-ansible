@@ -1,0 +1,259 @@
+---
+- name: Validate Connection String Information
+  ansible.builtin.assert:
+    that:
+      - database_connection_string is defined
+    quiet: true
+
+- name: Install Chocolatey Central Management Database
+  chocolatey.chocolatey.win_chocolatey:
+    name: chocolatey-management-database
+    package_params: '/SkipDatabasePermissionCheck'
+    choco_args: "--package-parameters-sensitive='/ConnectionString:{{ database_connection_string }}'"
+
+- name: Install Chocolatey Central Management Prerequisite Features
+  ansible.windows.win_feature:
+    name:
+      - Web-Server
+      - Web-AppInit
+      - Web-Scripting-Tools
+    state: present
+    include_management_tools: true
+
+- name: Install ASP.net Core Module
+  chocolatey.chocolatey.win_chocolatey:
+    name: dotnet-aspnetcoremodule-v2
+    version: "{{ lookup('file', 'chocolatey.json') | from_json | json_query('packages[?name==`dotnet-aspnetcoremodule-v2`].version | [0]') | default(omit) }}"
+    choco_args:
+      - --pin
+      - "--pin-reason='Latest version compatible with chocolatey-management-web {{ lookup('file', 'chocolatey.json') | from_json | json_query('packages[?name==`chocolatey-management-web`].version | [0]') | default('') }}'"
+
+- name: Install Dotnet 6.0 Runtime
+  chocolatey.chocolatey.win_chocolatey:
+    name: dotnet-6.0-runtime
+
+- name: Install ASP.net Runtime
+  chocolatey.chocolatey.win_chocolatey:
+    name: dotnet-6.0-aspnetruntime
+
+- name: Test Chocolatey Central Management Certificate
+  ansible.windows.win_powershell:
+    parameters:
+      CertificateThumbprint: "{{ certificate_thumbprint }}"
+    script: |
+      param(
+        # The certificate thumbprint to use for the CCM Service
+        [string]$CertificateThumbprint
+      )
+
+      $Ansible.Changed = $false
+      if ($CertificateThumbprint -notin (Get-ChildItem Cert:\LocalMachine\TrustedPeople).Thumbprint) {
+        Write-Error "You specified '$CertificateThumbprint' for use with CCM service, but the certificate is not in the required LocalMachine\TrustedPeople store!"
+        $Ansible.Failed = $true
+      }
+  when: certificate_thumbprint is defined
+
+- name: Install Chocolatey Central Management Certificate
+  when: certificate_thumbprint is not defined
+  block:
+    - name: Ensure Directory
+      ansible.windows.win_file:
+        path: C:\choco-setup\
+        state: directory
+
+    - name: Copy PFX File
+      ansible.windows.win_copy:
+        src: "{{ certificate_path }}"
+        dest: C:\choco-setup\ccm.pfx
+
+    - name: Install Certificate
+      ansible.windows.win_certificate_store:
+        path: C:\choco-setup\ccm.pfx
+        password: "{{ certificate_password }}"
+        store_location: LocalMachine
+        store_name: TrustedPeople
+        key_exportable: true
+        key_storage: machine
+      register: certificate
+
+    - name: Set Thumbprint
+      ansible.builtin.set_fact:
+        certificate_thumbprint: "{{ certificate.thumbprints[-1] }}"
+
+- name: Install Chocolatey Central Management Service
+  chocolatey.chocolatey.win_chocolatey:
+    name: chocolatey-management-service
+    package_params:
+      - "/CertificateThumbprint:{{ certificate_thumbprint }}"
+    choco_args:
+      - "--package-parameters-sensitive='/ConnectionString:{{ database_connection_string }}'"
+
+# This may not be needed, as we pass thumbprint above, but will allow us to use the same playbook to update the certificate
+# Should do the same thing for the database strings - TODO: see C4BAE.
+- name: Set Chocolatey Central Management Service Certificate
+  ansible.windows.win_powershell:
+    parameters:
+      CertificateThumbprint: "{{ certificate_thumbprint }}"
+    script: |
+      param(
+        # The certificate thumbprint to use for the CCM Service
+        [string]$CertificateThumbprint
+      )
+
+      $Ansible.Changed = $false
+
+      $jsonData = Get-Content $env:ChocolateyInstall\lib\chocolatey-management-service\tools\service\appsettings.json | ConvertFrom-Json
+      if ($jsonData.CertificateThumbprint -ne $CertificateThumbprint) {
+        $Ansible.Changed = $true
+
+        Stop-Service chocolatey-central-management
+
+        $jsonData.CertificateThumbprint = $CertificateThumbprint
+        $jsonData | ConvertTo-Json | Set-Content $env:chocolateyInstall\lib\chocolatey-management-service\tools\service\appsettings.json
+
+        Start-Service chocolatey-central-management
+      }
+  when: certificate.changed
+
+- name: Install Chocolatey Central Management Web
+  chocolatey.chocolatey.win_chocolatey:
+    name: chocolatey-management-web
+    choco_args:
+      - "--package-parameters-sensitive='/ConnectionString:{{ database_connection_string }}'"
+
+- name: Set Chocolatey Central Management Web Certificate
+  ansible.windows.win_powershell:
+    parameters:
+      Port: "{{ ccm_port }}"
+      CertificateThumbprint: "{{ certificate_thumbprint }}"
+    script: |
+      param($Port, $CertificateThumbprint)
+      Import-Module WebAdministration
+
+      $Existing = netsh http show sslcert ipport=0.0.0.0:$Port
+      $Ansible.Changed = $false
+
+      if ($Existing -match "The system cannot find the file specified." -or -not $Existing -match "Certificate Hash\s+:\s+$CertificateThumbprint") {
+        $Ansible.Changed = $true
+        if ($Existing -match "The system cannot find the file specified.") {
+          netsh http delete sslcert ipport=0.0.0.0:$Port
+        }
+
+        # Adjust permissions on the certificate
+        $KeyName = (Get-Item Cert:\LocalMachine\TrustedPeople\$CertificateThumbprint).PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName
+        $FullPath = Join-Path $env:ProgramData "\Microsoft\Crypto\RSA\MachineKeys\$($KeyName)"
+        if (Test-Path $FullPath) {
+          $Acl = Get-Acl $FullPath
+          $AccessRule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS AppPool\ChocolateyCentralManagement", "Read", "Allow")
+          $Acl.SetAccessRule($AccessRule)
+          Set-Acl $FullPath $Acl
+        } else {
+          Write-Error "Private Key may not be available for export. Ensure import was successful." -ErrorAction Stop
+        }
+
+        # Set the binding appropriately
+        Get-WebBinding -Name ChocolateyCentralManagement | Remove-WebBinding
+        New-WebBinding -Name ChocolateyCentralManagement -Protocol https -Port $Port -SslFlags 0 -IpAddress '*'
+
+        $Ansible.Result = netsh http add sslcert ipport=0.0.0.0:$Port certhash="$($CertificateThumbprint)" certstorename=TrustedPeople appid="$([Guid]::NewGuid().ToString("B"))"
+        $Ansible.Failed = $Ansible.Result -notcontains "SSL Certificate successfully added"
+      }
+
+- name: Set Chocolatey Central Management User FirstLogin
+  ansible.windows.win_powershell:
+    parameters:
+      ConnectionString: "{{ database_connection_string }}"
+    script: |
+      param($ConnectionString, $User = 'ccmadmin')
+      $Ansible.Changed = $false
+
+      $Shared = @{
+        SqlInstance  = Connect-DbaInstance -ConnectionString $ConnectionString -TrustServerCertificate
+        SqlParameter = @{UserName = $User}
+      }
+      $CurrentUser = Invoke-DbaQuery @Shared -Query "SELECT IsLockoutEnabled, ShouldChangePasswordOnNextLogin FROM [dbo].[AbpUsers] WHERE Name = @UserName and TenantId = '1'"
+
+      if ($CurrentUser.ShouldChangePasswordOnNextLogin -and $CurrentUser.IsLockoutEnabled) {
+        Invoke-DbaQuery @Shared -Query "UPDATE [dbo].[AbpUsers] SET ShouldChangePasswordOnNextLogin = 0, IsLockoutEnabled = 0 WHERE Name = @UserName and TenantId = '1'"
+        $Ansible.Changed = $true
+      }
+  delegate_to: "{{ database_server | default('ccm_server') }}"
+  register: firstlogin
+
+- name: Set Chocolatey Central Management User Password
+  ansible.windows.win_powershell:
+    parameters:
+      CcmEndpoint: "{{ ccm_fqdn }}:{{ ccm_port }}"
+      CcmPassword: "{{ ccm_password }}"
+    script: |
+      param($CcmEndpoint, $CcmPassword)
+
+      $loginParams = @{
+        Uri             = "https://$CcmEndpoint/Account/Login"
+        Body            = @{
+            usernameOrEmailAddress = "ccmadmin"
+            password               = "123qwe"
+        }
+        ContentType     = 'application/x-www-form-urlencoded'
+        Method          = "POST"
+        SessionVariable = "Session"
+        UseBasicParsing = $true
+      }
+      $null = Invoke-WebRequest @loginParams -ErrorAction Stop
+
+      $resetParams = @{
+        Uri             = "https://$CcmEndpoint/api/services/app/Profile/ChangePassword"
+        Body            = @{
+            CurrentPassword   = $loginParams.Body.Password
+            NewPassword       = $CcmPassword
+            NewPasswordRepeat = $CcmPassword
+        } | ConvertTo-Json
+        ContentType     = 'application/json'
+        Method          = "POST"
+        WebSession      = $Session
+        UseBasicParsing = $true
+      }
+      Invoke-RestMethod @resetParams
+  when: firstlogin.changed
+
+- name: Set Chocolatey Central Management Encryption Password
+  ansible.windows.win_powershell:
+    parameters:
+      CcmEndpoint: "{{ ccm_fqdn }}:{{ ccm_port }}"
+      CcmPassword: "{{ ccm_password }}"
+      CcmEncryptionPassword: "{{ ccm_encryption_password }}"
+    script: |
+      param($CcmEndpoint, $CcmPassword, $CcmEncryptionPassword)
+
+      $loginParams = @{
+        Uri             = "https://$CcmEndpoint/Account/Login"
+        Body            = @{
+            usernameOrEmailAddress = "ccmadmin"
+            password               = "$CcmPassword"
+        }
+        ContentType     = 'application/x-www-form-urlencoded'
+        Method          = "POST"
+        SessionVariable = "Session"
+        UseBasicParsing = $true
+      }
+      $null = Invoke-WebRequest @loginParams -ErrorAction Stop
+
+      # Get Current Settings
+      $ServerSettings = (Invoke-RestMethod -Uri https://$CcmEndpoint/api/services/app/TenantSettings/GetAllSettings -WebSession $Session).result
+      $ServerSettings.encryption.oldPassphrase     = ""
+      $ServerSettings.encryption.passphrase        = $CcmEncryptionPassword
+      $ServerSettings.encryption.confirmPassphrase = $CcmEncryptionPassword
+
+      $setParams = @{
+        Uri             = "https://$CcmEndpoint/api/services/app/TenantSettings/UpdateAllSettings"
+        Body            = $ServerSettings | ConvertTo-Json
+        ContentType     = 'application/json; charset=utf-8'
+        Method          = "PUT"
+        WebSession      = $Session
+        UseBasicParsing = $true
+      }
+      $Ansible.Result = Invoke-RestMethod @setParams
+
+      $Ansible.Failed = -not $Ansible.Result.success
+  when: firstlogin.changed
+...

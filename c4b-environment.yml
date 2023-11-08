@@ -1,0 +1,319 @@
+---
+- name: Setup Phase
+  hosts: localhost
+  gather_facts: true
+  vars_prompt:
+    - name: license_path
+      prompt: What is the path to your Chocolatey Business license?
+      default: ./files/chocolatey.license.xml
+      private: false
+
+    - name: certificate_path
+      prompt: What is the path to your Certificate file?
+      default: ./files/certificate.pfx
+      private: false
+
+    - name: certificate_password
+      prompt: What is the password to your Certificate file?
+      private: true
+      unsafe: true
+
+    - name: database_connection_string
+      prompt: If you already have a database, please provide the connection string. Otherwise hit enter without entering anything.
+  tasks:
+    - name: Ensure credentials Directory
+      ansible.builtin.file:
+        path: credentials
+        state: directory
+
+    - name: Ensure a valid Chocolatey for Business License
+      block:
+        - name: Get Chocolatey License
+          ansible.builtin.set_fact:
+            license_content: "{{ lookup('file', license_path) }}"
+
+        - name: Get Chocolatey License Expiration
+          ansible.builtin.set_fact:
+            license_expiry: "{{ license_content | regex_search('expiration=\".+?\"') | regex_replace('expiration=\"(.+)\"', '\\1') | trim() }}"
+
+        - name: Test License Expiry
+          ansible.builtin.assert:
+            that:
+              - license_expiry is defined
+              - license_expiry | to_datetime('%Y-%m-%dT%H:%M:%S.0000000')
+              - license_expiry > ansible_date_time.iso8601
+            quiet: true
+
+    # - name: Ensure valid Certificate(s)
+    - name: Test Certificate Password
+      community.crypto.openssl_pkcs12:
+        action: parse
+        src: "{{ certificate_path }}"
+        path: credentials/cert.cer
+        passphrase: "{{ certificate_password }}"
+
+    - name: Check Certificate Values
+      community.crypto.x509_certificate_info:
+        path: credentials/cert.cer
+      register: cert_data
+
+    - name: Test Certificate Values
+      ansible.builtin.assert:
+        that:
+          - cert_data.subject.commonName is defined
+          - cert_data.subject.commonName is not match('^\*\.')
+        quiet: true
+
+    - name: Set Certificate Path
+      ansible.builtin.set_fact:
+        certificate_path: "{{ certificate_path }}"
+        certificate_password: "{{ certificate_password }}"
+        ccm_fqdn: "{{ cert_data.subject.commonName }}"
+
+    - name: Set FQDN Value in File
+      ansible.builtin.copy:
+        dest: credentials/ccm_fqdn
+        content: "{{ cert_data.subject.commonName }}"
+
+    - name: Set database_connection_string
+      ansible.builtin.set_fact:
+        database_connection_string: "{{ database_connection_string }}"
+      when: database_connection_string is defined
+
+    - name: Find Local Packages
+      ansible.builtin.find:
+        paths: files
+        patterns: '*.nupkg'
+      register: existing_packages
+
+    - name: Find Local Plugins
+      ansible.builtin.find:
+        paths: files
+        patterns: 'JenkinsPlugins.zip'
+      register: existing_plugins
+
+  tags: setup, always
+
+- name: Setup Nexus Repository
+  hosts: "{{ nexus_server | default('ccm_server') }}"
+  handlers:
+    - name: Remove Local Chocolatey Source
+      chocolatey.chocolatey.win_chocolatey_source:
+        name: "choco-setup"
+        state: absent
+  vars:
+    local_package_path: C:\choco-setup\
+    certificate_path: "{{ hostvars['localhost']['certificate_path'] }}"
+    certificate_password: "{{ hostvars['localhost']['certificate_password'] }}"
+  tasks:
+    - name: Ensure Local Package Directory
+      ansible.windows.win_file:
+        path: "{{ local_package_path }}"
+        state: directory
+
+    - name: Copy Local Install Files
+      ansible.windows.win_copy:
+        src: "{{ item }}"
+        dest: "{{ local_package_path }}"
+        _copy_mode: explode
+      when: hostvars.localhost.existing_packages.files | length > 0
+      loop: "{{ hostvars.localhost.existing_packages.files | selectattr('path', 'in', (lookup('file', 'chocolatey.json') | from_json | json_query('nexus_server') | list)) | map(attribute='path') | list }}"
+
+    - name: Redefine Repository
+      ansible.builtin.set_fact:
+        repository:
+          - name: ChocolateySetup
+            url: "{{ local_package_path }}"
+      when: hostvars.localhost.existing_packages.files | length > 0
+
+    - name: Ensure Chocolatey
+      ansible.builtin.include_role:
+        name: win_chocolateylicensed
+      vars:
+        license_content: "{{ hostvars.localhost.license_content }}"
+
+    - name: Setup Nexus
+      ansible.builtin.import_tasks: setup-nexus.yml
+
+    - name: Upload Packages to Setup Repository
+      upload_nupkg_to_nexus:
+        baseuri: "https://{{ nexus_fqdn }}:{{ nexus_port }}"
+        repository: ChocolateySetup
+        file: "{{ item }}"
+        username: admin
+        password: "{{ nexus_password }}"
+      when: hostvars.localhost.existing_packages.files | length > 0
+      loop: "{{ hostvars.localhost.existing_packages.files | map(attribute='path') | list }}"
+      delegate_to: localhost
+      no_log: true
+  tags: nexus
+
+- name: Setup Servers
+  hosts:
+    - "{{ ccm_server | default('ccm_server') }}"
+    - "{{ database_server | default('ccm_server') }}"
+    - "{{ jenkins_server | default('ccm_server') }}"
+    - "{{ nexus_server | default('ccm_server') }}"
+  tasks:
+    - name: Redefine Repository
+      ansible.builtin.set_fact:
+        repository:
+          - name: ChocolateySetup
+            url: "https://{{ nexus_fqdn }}:{{ nexus_port }}/repository/ChocolateySetup/index.json"
+            user: chocouser
+            password: "{{ chocouser_password }}"
+      when: hostvars.localhost.existing_packages.files | length > 0
+
+    - name: Ensure Chocolatey
+      ansible.builtin.include_role:
+        name: win_chocolateylicensed
+      vars:
+        license_content: "{{ hostvars.localhost.license_content }}"
+
+- name: Setup Jenkins
+  hosts: "{{ jenkins_server | default('ccm_server') }}"
+  vars:
+    certificate_path: "{{ hostvars['localhost']['certificate_path'] }}"
+    certificate_password: "{{ hostvars['localhost']['certificate_password'] }}"
+  tasks:
+    - name: Setup Jenkins
+      ansible.builtin.import_tasks: setup-jenkins.yml
+  tags: jenkins
+
+- name: Setup Database
+  hosts: "{{ database_server | default('ccm_server') }}"
+  tasks:
+    - name: Install DbaTools Library
+      chocolatey.chocolatey.win_chocolatey:
+        name: dbatools-library.powershell
+        state: present
+
+    - name: Install DbaTools
+      chocolatey.chocolatey.win_chocolatey:
+        name: dbatools
+        state: present
+
+    - name: Setup Database
+      ansible.builtin.import_tasks: setup-database.yml
+      when: hostvars['localhost']['database_connection_string'] is not defined
+
+    - name: Set Connection String
+      ansible.builtin.set_fact:
+        database_connection_string: "{{ hostvars['localhost']['database_connection_string'] }}"
+      when: hostvars['localhost']['database_connection_string'] is defined
+  tags: database
+
+- name: Setup Chocolatey Central Management
+  hosts: ccm_server
+  vars:
+    certificate_path: "{{ hostvars['localhost']['certificate_path'] }}"
+    certificate_password: "{{ hostvars['localhost']['certificate_password'] }}"
+    database_connection_string: "{{ hostvars['database_server']['database_connection_string'] }}"
+  tasks:
+    - name: Setup CCM
+      ansible.builtin.import_tasks: setup-ccm.yml
+  tags: ccm
+
+- name: Output Connection File
+  hosts: localhost
+  tasks:
+    - name: Output Environment Configuration Document
+      ansible.builtin.template:
+        src: templates/Passwords.html.j2
+        dest: credentials/CCM.html
+        mode: '600'
+  tags: creds
+
+- name: Create License Package
+  hosts: ccm_server
+  tasks:
+    - name: Ensure Package Directory
+      ansible.windows.win_file:
+        path: "{{ local_package_path }}\\chocolatey-license"
+        state: directory
+
+    - name: Drop Files
+      ansible.windows.win_template:
+        src: "{{ item }}"
+        dest: "{{ local_package_path }}\\chocolatey-license\\{{ item | basename | regex_replace('\\.j2$', '') }}"
+      with_fileglob:
+        - "../templates/LicensePackage/*.j2"
+      register: license_files
+
+    - name: Pack and Push License Package
+      ansible.windows.win_powershell:
+        parameters:
+          PackagePath: "{{ local_package_path }}\\chocolatey-license\\"
+          LicenseExpiry: "{{ hostvars.localhost.license_expiry }}"
+        script: |
+          param(
+            [string]$PackagePath,
+            [string]$LicenseExpiry
+          )
+          $Version = Get-Date $LicenseExpiry -f "yyyy.MM.dd"
+
+          Get-ChildItem $PackagePath -Recurse -Filter "chocolatey-license.nuspec" | ForEach-Object {
+            choco pack $_.FullName --version $Version --output-directory $PackagePath
+          }
+
+          if ($LastExitCode -eq 0) {
+            Get-ChildItem $PackagePath -Filter *.nupkg | ForEach-Object {
+              choco push $_.FullName --source "https://{{ nexus_fqdn }}:{{ nexus_port }}/repository/ChocolateyInternal/" --api-key "{{ lookup('file', 'credentials/nexus_apikey') }}"
+
+              if ($LastExitCode -ne 0) {
+                $Ansible.Failed = $true
+              }
+            }
+          }
+      when: license_files.changed
+  vars:
+    local_package_path: "C:\\choco-setup\\packages"
+  tags: licensepackage
+
+- name: Internalize Packages
+  hosts: localhost
+  tasks:
+    - name: Run Internalization Job
+      when: internalize_packages is defined
+      trigger_jenkins_build:
+        baseurl: "https://{{ jenkins_fqdn }}:{{ jenkins_port }}"
+        username: "admin"
+        password: "{{ jenkins_password }}"
+        name: Internalize packages from the Chocolatey Community and Licensed Repositories
+        parameters:
+          P_PKG_LIST: "{{ internalize_packages | join(',') }}"
+      no_log: true
+  tags: internalize
+
+- name: Final Setup
+  hosts:
+    - "{{ ccm_server | default('ccm_server') }}"
+    - "{{ database_server | default('ccm_server') }}"
+    - "{{ jenkins_server | default('ccm_server') }}"
+    - "{{ nexus_server | default('ccm_server') }}"
+  tasks:
+    - name: Add Agent to Server
+      ansible.builtin.include_role:
+        name: win_chocolateyagent
+
+    - name: Ensure ChocolateySetup is Removed
+      chocolatey.chocolatey.win_chocolatey_source:
+        name: ChocolateySetup
+        state: absent
+
+    - name: Add README.html
+      ansible.windows.win_template:
+        src: templates/Passwords.html.j2
+        dest: C:\\choco-setup\\README.html
+        mode: '600'
+  vars:
+    ccm_hostname: "{{ ccm_fqdn }}"
+    repository:
+      - name: ChocolateyInternal
+        url: "https://{{ nexus_fqdn }}:{{ nexus_port }}/repository/ChocolateyInternal/index.json"
+        user: chocouser
+        password: "{{ chocouser_password }}"
+    client_salt: "{{ ccm_client_salt }}"
+    service_salt: "{{ ccm_service_salt }}"
+  tags: chocolatey, agent
+...

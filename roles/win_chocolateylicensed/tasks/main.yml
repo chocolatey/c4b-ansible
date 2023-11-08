@@ -1,0 +1,229 @@
+---
+- name: Ensure a valid Chocolatey for Business License
+  block:
+    - name: Get Chocolatey License
+      ansible.builtin.set_fact:
+        license_content: "{{ lookup('file', license_path) }}"
+      when: license_content is not defined and license_path is defined
+
+    - name: Get Chocolatey License Expiration
+      ansible.builtin.set_fact:
+        license_expiry: "{{ license_content | regex_search('expiration=\".+?\"') | regex_replace('expiration=\"(.+)\"', '\\1') | trim() }}"
+      when: license_content is defined
+
+    - name: Test License Expiry
+      ansible.builtin.assert:
+        that:
+          - license_expiry is defined
+          - license_expiry | to_datetime('%Y-%m-%dT%H:%M:%S.0000000')
+          - license_expiry > ansible_date_time.iso8601
+        quiet: true
+      when: license_expiry is defined
+
+- name: Ensure choco-setup Directory
+  ansible.windows.win_file:
+    path: C:\\choco-setup\\
+    state: directory
+
+- name: Ensure Dotnet 4.8
+  ansible.windows.win_powershell:
+    parameters:
+      NetFx48InstallerFile: "{{ ndp48_location | default('https://download.visualstudio.microsoft.com/download/pr/2d6bb6b2-226a-4baa-bdec-798822606ff1/8494001c276a4b96804cde7829c04d7f/ndp48-x86-x64-allos-enu.exe') }}"
+    script: |
+      param($NetFx48InstallerFile)
+
+      if ((Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -ErrorAction SilentlyContinue).Release -lt 528040) {
+        Write-Warning ".NET Framework 4.8 is required for Chocolatey. Installing .NET Framework 4.8..."
+
+        # Attempt to download the installer if it doesn't exist locally
+        if (-not (Test-Path $NetFx48InstallerFile)) {
+          try {
+            $DownloadArgs = @{
+              Uri = $NetFx48InstallerFile
+              OutFile = Join-Path "C:\choco-setup\" $(Split-Path $NetFx48InstallerFile -Leaf)
+              UseBasicParsing = $true
+            }
+            if (-not (Test-Path $DownloadArgs.OutFile)) {
+              Invoke-WebRequest @DownloadArgs -ErrorAction Stop
+            }
+            $NetFx48InstallerFile = $DownloadArgs.OutFile
+          } catch {
+            $Ansible.failed = $true
+            throw "Could not download .NET Framework 4.8"
+          }
+        }
+
+        # Install .NET Framework 4.8
+        try {
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.WorkingDirectory = "C:\choco-setup\"
+          $psi.FileName = $NetFx48InstallerFile
+          $psi.Arguments = "/q /norestart"
+
+          $s = [System.Diagnostics.Process]::Start($psi)
+          $s.WaitForExit()
+
+          $Ansible.changed = $true
+
+          if ($s.ExitCode -notin (0, 1641, 3010)) {
+            $Ansible.message = "$($s.StandardOutput.ReadToEnd())" + "$($s.StandardError.ReadToEnd())"
+            $Ansible.failed = $true
+          }
+        } catch {
+          $Ansible.failed = $true
+          throw
+        }
+      } else {
+        $Ansible.changed = $false
+      }
+  register: dotnet_install
+
+- name: Reboot Server for Prerequisites
+  ansible.windows.win_reboot:
+  when: dotnet_install.changed
+
+- name: Drop Install Script
+  ansible.windows.win_copy:
+    dest: C:\\choco-setup\\install.ps1
+    content: "{{ lookup('file', 'Install.ps1') }}"
+    force: true
+
+- name: Get Chocolatey Package
+  ansible.windows.win_powershell:
+    parameters:
+      RepositoryUrl: "{{ repository[0].url }}"
+      ChocolateyVersion: "{{ chocolatey_version }}"
+    script: |
+      param($RepositoryUrl, $ChocolateyVersion)
+      $Ansible.Changed = $false
+
+      if (Test-Path $RepositoryUrl) {
+        $NupkgPath = Get-ChildItem $RepositoryUrl -Filter 'chocolatey.*.nupkg' | Select-Object -First 1 -ExpandProperty FullName
+      } else {
+        $webClient = New-Object System.Net.WebClient
+        try {
+          $Credential = [PSCredential]::new(
+            '{{ repository[0].user | default('') }}',
+            (ConvertTo-SecureString '{{ repository[0].password | default('') }}' -AsPlainText -Force)
+          )
+          $webClient.Credentials = $Credential.GetNetworkCredential()
+        } catch {}
+
+        $NupkgUrl = if (-not $ChocolateyVersion -or $ChocolateyVersion -eq 'latest') {
+          $QueryString = "((Id eq 'chocolatey') and (not IsPrerelease)) and IsLatestVersion"
+          $Query = 'Packages()?$filter={0}' -f [uri]::EscapeUriString($queryString)
+          $QueryUrl = ($RepositoryUrl.TrimEnd('/index.json'), $Query) -join '/'  # We need v2 for this query
+
+          [xml]$result = $webClient.DownloadString($QueryUrl)
+          $result.feed.entry.content.src
+        } else {
+          # Otherwise, assume the URL
+          "$($RepositoryUrl.Trim('/'))/chocolatey/$($ChocolateyVersion)"
+        }
+
+        $NupkgPath = "C:\choco-setup\chocolatey.zip"
+        if (-not (Test-Path $NupkgPath)) {
+          try {
+            $webClient.DownloadFile($NupkgUrl, $NupkgPath)
+          } catch {
+            $Ansible.Failed = $true
+          }
+          $Ansible.Changed = $true
+        }
+      }
+
+      $Ansible.Result = $NupkgPath
+  when: repository[0].url is not match("https\:\/\/community\.chocolatey\.org\/api\/v2\/?;https\:\/\/licensedpackages\.chocolatey\.org\/api\/v2\/")
+  register: local_choco_package
+
+- name: Install Chocolatey
+  chocolatey.chocolatey.win_chocolatey:
+    name: chocolatey
+    state: "{{ 'latest' if chocolatey_version == 'latest' or chocolatey_version is undefined or chocolatey_version == omit else 'downgrade' }}"
+    source: "{{ repository[0].url | default(omit) }}"
+    source_username: "{{ repository[0].user | default(omit) }}"
+    source_password: "{{ repository[0].password | default(omit) }}"
+    bootstrap_script: C:\\choco-setup\\install.ps1
+  environment:
+    chocolateyDownloadUrl: "{{ local_choco_package.result | default('') }}"
+    chocolateyUseWindowsCompression: 'true'
+  register: choco_install
+  ignore_errors: true
+
+- name: Install Chocolatey License Package
+  chocolatey.chocolatey.win_chocolatey:
+    name: chocolatey-license
+    state: latest
+    source: "{{ repository[0].url | mandatory }}"
+    source_username: "{{ repository[0].user | default(omit) }}"
+    source_password: "{{ repository[0].password | default(omit) }}"
+  when: license_content is not defined
+
+- name: Ensure License Directory
+  ansible.windows.win_file:
+    path: C:\\ProgramData\\chocolatey\\license\\
+    state: directory
+  when: license_content is defined
+
+- name: Install Chocolatey License
+  ansible.windows.win_copy:
+    dest: "C:\\ProgramData\\chocolatey\\license\\chocolatey.license.xml"
+    content: "{{ license_content }}"
+    force: true
+  when: license_content is defined
+
+- name: Install Chocolatey.Extension
+  chocolatey.chocolatey.win_chocolatey:
+    name: chocolatey.extension
+    state: latest
+    source: "{{ repository[0].url | default(omit) }}"
+    source_username: "{{ repository[0].user | default(omit) }}"
+    source_password: "{{ repository[0].password | default(omit) }}"
+    package_params: /NoContextMenu
+
+- name: Set Chocolatey Features
+  chocolatey.chocolatey.win_chocolatey_feature:
+    name: "{{ item.key }}"
+    state: "{{ item.value }}"
+  with_dict: "{{ chocolatey_features }}"
+
+- name: Set Chocolatey Configuration
+  chocolatey.chocolatey.win_chocolatey_config:
+    name: "{{ item.key }}"
+    state: "{{ 'absent' if not item.value else 'present' }}"
+    value: "{{ item.value | default('omit') }}"
+  with_dict: "{{ chocolatey_config }}"
+
+- name: Add Chocolatey Source
+  chocolatey.chocolatey.win_chocolatey_source:
+    name: "{{ item.name }}"
+    source: "{{ item.url }}"
+    source_username: "{{ item.user | default(omit) }}"
+    source_password: "{{ item.password | default(omit) }}"
+    priority: 1
+    state: present
+  loop: "{{ repository }}"
+  when: repository[0].name is defined
+  no_log: true
+
+- name: Install ChocolateyGUI
+  chocolatey.chocolatey.win_chocolatey:
+    name: chocolateygui
+    state: latest
+  when: install_gui is not false
+
+- name: Install ChocolateyGUI Extension
+  chocolatey.chocolatey.win_chocolatey:
+    name: chocolateygui.extension
+    state: latest
+  when: install_gui is not false
+
+- name: Disable other sources
+  chocolatey.chocolatey.win_chocolatey_source:
+    name: "{{ item }}"
+    state: disabled
+  loop:
+    - chocolatey
+    - chocolatey.licensed
+  when: repository[0].url is not match("https\:\/\/community\.chocolatey\.org\/api\/v2\/?;https\:\/\/licensedpackages\.chocolatey\.org\/api\/v2\/?")
+...

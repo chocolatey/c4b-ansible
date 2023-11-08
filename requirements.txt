@@ -1,0 +1,5 @@
+-i https://pypi.org/simple
+passlib 1.7.4
+pywinrm>=0.2.2
+jmespath
+dnspython

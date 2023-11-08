@@ -1,0 +1,222 @@
+---
+- name: Install {{ java_package_id }}
+  chocolatey.chocolatey.win_chocolatey:
+    name: "{{ java_package_id }}"
+    version: "{{ java_package_version | default(omit) }}"
+    state: "{{ 'latest' if java_package_version == 'latest' or java_package_version is undefined or java_package_version == omit else 'downgrade' }}"
+
+- name: Add Firewall Exception for Jenkins
+  community.windows.win_firewall_rule:
+    name: Jenkins
+    action: allow
+    description: Allow inbound traffic to the Jenkins site
+    localport: "{{ jenkins_port | default(8080) }}"
+    protocol: tcp
+
+- name: Ignore Jenkins Setup Wizard
+  ansible.windows.win_environment:
+    level: machine
+    variables:
+      JAVA_OPTS: -Djenkins.install.runSetupWizard=false
+
+- name: Install Jenkins
+  chocolatey.chocolatey.win_chocolatey:
+    name: jenkins
+    state: latest
+  register: jenkins_install
+
+- name: Configure Jenkins FirstRun
+  block:
+    - name: Get Chocolatey Data
+      chocolatey.chocolatey.win_chocolatey_facts:
+
+    - name: Get Jenkins Package Version
+      ansible.builtin.set_fact:
+        jenkins_version: "{{ ansible_chocolatey.packages | selectattr('package', 'equalto', 'jenkins') | map(attribute='version') | join('') }}"
+
+    - name: Provide LastUpgradeWizard
+      ansible.windows.win_copy:
+        dest: "C:\\ProgramData\\Jenkins\\.jenkins\\jenkins.install.UpgradeWizard.state"
+        content: "{{ jenkins_version }}"
+
+    - name: Provide LastExecVersion
+      ansible.windows.win_copy:
+        dest: "C:\\ProgramData\\Jenkins\\.jenkins\\jenkins.install.InstallUtil.lastExecVersion"
+        content: "{{ jenkins_version }}"
+
+    - name: Provide LocationConfiguration
+      ansible.windows.win_copy:
+        dest: "C:\\ProgramData\\Jenkins\\.jenkins\\jenkins.model.JenkinsLocationConfiguration.xml"
+        content: |
+          <?xml version='1.1' encoding='UTF-8'?>
+            <jenkins.model.JenkinsLocationConfiguration>
+            <adminAddress>address not configured yet &lt;nobody@nowhere&gt;</adminAddress>
+            <jenkinsUrl>https://{{ jenkins_fqdn | default('localhost') }}:{{ jenkins_port | default(8080) }}/</jenkinsUrl>
+          </jenkins.model.JenkinsLocationConfiguration>
+
+    - name: Unzip Plugins
+      block:
+        - name: Copy Plugins Zip
+          ansible.windows.win_copy:
+            src: "JenkinsPlugins.zip"
+            dest: "C:\\ProgramData\\Jenkins\\.jenkins\\plugins\\"
+            _copy_mode: explode
+          when: hostvars.localhost.existing_plugins.files | length > 0
+
+        - name: Unzip Plugins Zip
+          ansible.windows.win_powershell:
+            parameters:
+              ZipPath: C:\\ProgramData\\Jenkins\\.jenkins\\plugins\\JenkinsPlugins.zip
+            script: |
+              param($ZipPath = "C:\choco-setup\jenkinsplugins.zip")
+              $PluginPath = "C:\ProgramData\Jenkins\.jenkins\plugins"
+              if (-not (Test-Path $PluginPath -PathType Container)) {
+                $null = New-Item $PluginPath -ItemType Directory
+              }
+              if (Test-Path $ZipPath) {
+                Expand-Archive -Path $ZipPath -DestinationPath $PluginPath
+              }
+          when: hostvars.localhost.existing_plugins.files | length > 0
+
+    - name: Get Existing Plugins
+      ansible.windows.win_find:
+        paths: "C:\\ProgramData\\Jenkins\\.jenkins\\plugins\\"
+        recurse: true
+        patterns: '*.hpi'
+      register: existing_plugins
+
+    - name: Download Plugins
+      ansible.windows.win_get_url:
+        url: "https://updates.jenkins-ci.org/download/plugins/{{ item.name }}/{{ item.version }}/{{ item.name }}.hpi"
+        dest: "C:\\ProgramData\\Jenkins\\.jenkins\\plugins\\{{ item.name }}.hpi"
+      when: item.name not in existing_plugins | json_query('files[].filename') | map('regex_replace', '(.+)\.hpi$', '\\1')
+      register: plugin_download
+      until: plugin_download is not failed
+      retries: 3  # Retry logic to harden against occassional HTTP errors in this large list.
+      loop: "{{ lookup('file', 'jenkins.json') | from_json | json_query('plugins') | list }}"
+
+- name: Set Jenkins Certificate
+  when: certificate_path is defined
+  block:
+    - name: Ensure Directory
+      ansible.windows.win_file:
+        path: C:\choco-setup\
+        state: directory
+
+    - name: Copy Certificate to Disk
+      ansible.windows.win_copy:
+        src: "{{ certificate_path }}"
+        dest: C:\choco-setup\jenkins.pfx
+      register: certificate_copy
+
+    - name: Install Jenkins Certificate
+      ansible.windows.win_powershell:
+        parameters:
+          JenkinsPort: "{{ jenkins_port | default(8080) }}"
+          CertificatePath: "{{ certificate_copy.dest }}"
+          CertificatePassword: "{{ certificate_password }}"
+        script: |
+          param($CertificatePath, $CertificatePassword, $JenkinsPort)
+
+          # Generate the Keystore file
+          $KeyStore = "C:\ProgramData\Jenkins\.jenkins\keystore.jks"
+          $KeyTool = Convert-Path "C:\Program Files\Eclipse Adoptium\jre-11.*\bin\keytool.exe"
+          $Passkey = '{{ lookup('ansible.builtin.password', '/dev/null', chars=['ascii_letters', 'digits'], length=32, seed=certificate_password+inventory_hostname) }}'
+
+          if (Test-Path $KeyStore) {
+            Remove-Item $KeyStore -Force
+          }
+
+          $CurrentAlias = (($CertificatePassword | & $KeyTool -list -v -storetype PKCS12 -keystore $CertificatePath) -match "^Alias.*").Split(':')[1].Trim()
+
+          & $KeyTool -importkeystore -srckeystore $CertificatePath -srcstoretype PKCS12 -srcstorepass $CertificatePassword -destkeystore $KeyStore -deststoretype JKS -alias $currentAlias -destalias jetty -deststorepass $Passkey
+          & $KeyTool -keypasswd -keystore $KeyStore -alias jetty -storepass $Passkey -keypass $CertificatePassword -new $Passkey
+
+          # Update the Jenkins Configuration
+          $XmlPath = "C:\Program Files\Jenkins\jenkins.xml"
+          [xml]$Xml = Get-Content $XmlPath
+          @{
+            httpPort              = -1
+            httpsPort             = $JenkinsPort
+            httpsKeyStore         = $KeyStore
+            httpsKeyStorePassword = $Passkey
+          }.GetEnumerator().ForEach{
+            if ($Xml.SelectSingleNode("/service/arguments")."#text" -notmatch [Regex]::Escape("--$($_.Key)=$($_.Value)")) {
+              $Xml.SelectSingleNode("/service/arguments")."#text" = $Xml.SelectSingleNode("/service/arguments")."#text" -replace "\s*--$($_.Key)=.+?\b", ""
+              $Xml.SelectSingleNode("/service/arguments")."#text" += " --$($_.Key)=$($_.Value)"
+            }
+          }
+          $Xml.Save($XmlPath)
+
+          Restart-Service jenkins
+      when: certificate_copy.changed
+
+- name: Install Jenkins Scripts
+  chocolatey.chocolatey.win_chocolatey:
+    name: chocolatey-licensed-jenkins-scripts
+    state: latest
+
+- name: Configure Jenkins Jobs
+  vars:
+    nuget_api_key: "{{ lookup('file', 'credentials/nexus_apikey') }}"
+    nexus_hostname: "{{ nexus_fqdn }}"
+    jobs:
+      - name: Update test repository from Chocolatey Community and Licensed Repositories
+      - name: Update production repository
+      - name: Internalize packages from the Chocolatey Community and Licensed Repositories
+  block:
+    - name: Ensure Directory
+      ansible.windows.win_file:
+        path: "C:\\ProgramData\\Jenkins\\.jenkins\\jobs\\{{ item.name }}\\"
+        state: directory
+      loop: "{{ jobs }}"
+
+    - name: Define Job
+      ansible.windows.win_template:
+        src: templates/JenkinsJobs/{{ item.name }}.xml.j2
+        dest: "C:\\ProgramData\\Jenkins\\.jenkins\\jobs\\{{ item.name }}\\config.xml"
+        output_encoding: utf-8
+      loop: "{{ jobs }}"
+
+# - name: Get Admin Config File
+#   win_find:
+#     paths: "C:\\ProgramData\\Jenkins\\.jenkins\\users\\"
+#     patterns: "config.xml"
+#     recurse: true
+#   register: _admin_config_file
+
+# - name: Set Admin Password
+#   win_lineinfile:
+#     path: "C:/ProgramData/Jenkins/.jenkins/users/admin_14371412314378460772/config.xml" # "{{ _admin_config_file.files[0].path }}"
+#     regex: "<passwordHash>#jbcrypt:.+</passwordHash>"
+#     line: "<passwordHash>#jbcrypt:{{ jenkins_password | default('Just24Now') | password_hash('bcrypt', lookup('password', '/tmp/my-salt length=30 chars=letters,digits')+'.') }}</passwordHash>"  # TODO: Need Salt?
+#     validate: "[xml]$Xml = Get-Content %s"
+#   removes: "C:\\ProgramData\\Jenkins\\.jenkins\\secrets\\initialAdminPassword"
+
+- name: Set Admin Password
+  ansible.windows.win_powershell:
+    parameters:
+      JenkinsPassword: "{{ jenkins_password }}"
+    script: |
+      param($JenkinsPassword)
+      if (-not (Test-Path "$env:TEMP\bcrypt.net.0.1.0\lib\net35\BCrypt.Net.dll")) {
+        $ZipPath = "$PSScriptRoot\bcrypt.net.0.1.0.zip"
+        Invoke-WebRequest -Uri 'https://www.nuget.org/api/v2/package/BCrypt.Net/0.1.0' -OutFile $ZipPath -UseBasicParsing
+        Expand-Archive -Path $ZipPath -DestinationPath $env:TEMP\bcrypt.net.0.1.0
+      }
+
+      Add-Type -Path "$env:TEMP\bcrypt.net.0.1.0\lib\net35\BCrypt.Net.dll"
+
+      $AdminUserPath = Resolve-Path "C:\ProgramData\Jenkins\.jenkins\users\admin_*\config.xml"
+
+      $HashedPassword = [bcrypt.net.bcrypt]::hashpassword($JenkinsPassword, [bcrypt.net.bcrypt]::generatesalt(15))
+      (Get-Content $AdminUserPath) -replace '<passwordHash>#jbcrypt:.+</passwordHash>',
+          "<passwordHash>#jbcrypt:$($HashedPassword)</passwordHash>" |
+          Set-Content $AdminUserPath -Force
+
+- name: Restart Jenkins Service
+  ansible.windows.win_service:
+    name: jenkins
+    state: restarted
+  when: jenkins_install.changed
+...
