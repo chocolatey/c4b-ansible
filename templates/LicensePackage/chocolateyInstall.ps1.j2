@@ -1,0 +1,7 @@
+$ErrorActionPreference = 'Stop'
+$toolsDir              = Split-Path $MyInvocation.MyCommand.Definition -Parent
+$licenseFile           = "$toolsDir\chocolatey.license.xml"
+
+New-Item "$env:ChocolateyInstall\license" -ItemType Directory -Force
+Copy-Item -Path $licenseFile -Destination $env:ChocolateyInstall\license\chocolatey.license.xml -Force
+Write-Verbose "The license has been installed."

@@ -1,0 +1,15 @@
+{
+  "name": "Ansible",
+  "dockerFile": "dockerfile",
+  // "mounts": [
+  // 	"source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+  // ],
+  "forwardPorts": [],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "redhat.ansible"
+      ]
+    }
+  }
+}

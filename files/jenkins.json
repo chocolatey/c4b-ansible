@@ -1,0 +1,32 @@
+{
+    "plugins": [
+        { "name": "apache-httpcomponents-client-4-api", "version": "4.5.14-208.v438351942757" },
+        { "name": "bouncycastle-api", "version": "2.29" },
+        { "name": "branch-api", "version": "2.1122.v09cb_8ea_8a_724" },
+        { "name": "caffeine-api", "version": "3.1.8-133.v17b_1ff2e0599" },
+        { "name": "cloudbees-folder", "version": "6.848.ve3b_fd7839a_81" },
+        { "name": "display-url-api", "version": "2.3.9" },
+        { "name": "durable-task", "version": "523.va_a_22cf15d5e0" },
+        { "name": "instance-identity", "version": "173.va_37c494ec4e5" },
+        { "name": "ionicons-api", "version": "56.v1b_1c8c49374e" },
+        { "name": "jakarta-activation-api", "version": "2.0.1-3" },
+        { "name": "jakarta-mail-api", "version": "2.0.1-3" },
+        { "name": "javax-activation-api", "version": "1.2.0-6" },
+        { "name": "javax-mail-api", "version": "1.6.2-9" },
+        { "name": "mailer", "version": "463.vedf8358e006b_" },
+        { "name": "pipeline-groovy-lib", "version": "671.v07c339c842e8" },
+        { "name": "scm-api", "version": "676.v886669a_199a_a_" },
+        { "name": "script-security", "version": "1273.v66c1964f0dfd" },
+        { "name": "structs", "version": "325.vcb_307d2a_2782" },
+        { "name": "variant", "version": "59.vf075fe829ccb" },
+        { "name": "workflow-api", "version": "1261.va_2ff5204f17e" },
+        { "name": "workflow-basic-steps", "version": "1042.ve7b_140c4a_e0c" },
+        { "name": "workflow-cps", "version": "3773.v505e0052522c" },
+        { "name": "workflow-durable-task-step", "version": "1289.v4d3e7b_01546b_" },
+        { "name": "workflow-job", "version": "1341.vd9fa_65f771dd" },
+        { "name": "workflow-multibranch", "version": "756.v891d88f2cd46" },
+        { "name": "workflow-scm-step", "version": "415.v434365564324" },
+        { "name": "workflow-step-api", "version": "639.v6eca_cd8c04a_a_" },
+        { "name": "workflow-support", "version": "848.v5a_383b_d14921" }
+    ]
+}

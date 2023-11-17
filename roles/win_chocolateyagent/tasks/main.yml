@@ -1,0 +1,30 @@
+---
+- name: Ensure Chocolatey
+  ansible.builtin.include_role:
+    name: win_chocolateylicensed
+
+- name: Install Chocolatey Agent
+  chocolatey.chocolatey.win_chocolatey:
+    name: chocolatey-agent
+    state: latest
+
+- name: Configure Chocolatey Agent to use Chocolatey Central Management
+  block:
+    - name: Set Chocolatey Configuration
+      chocolatey.chocolatey.win_chocolatey_config:
+        name: "{{ item.key }}"
+        state: "{{ 'absent' if not item.value else 'present' }}"
+        value: "{{ item.value | default('omit') }}"
+      with_dict:
+        - CentralManagementServiceUrl: "https://{{ ccm_hostname }}:24020/ChocolateyManagementService"
+        - CentralManagementClientCommunicationSaltAdditivePassword: "{{ client_salt | default(omit) }}"
+        - centralManagementServiceCommunicationSaltAdditivePassword: "{{ service_salt | default(omit) }}"
+
+    - name: Set Chocolatey Features
+      chocolatey.chocolatey.win_chocolatey_feature:
+        name: "{{ item.key }}"
+        state: "{{ item.value }}"
+      with_dict:
+        - useChocolateyCentralManagement: enabled
+        - useChocolateyCentralManagementDeployments: enabled
+...

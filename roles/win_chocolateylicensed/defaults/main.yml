@@ -1,0 +1,19 @@
+chocolatey_version: latest
+
+install_gui: false
+
+repository:
+  - url: https://community.chocolatey.org/api/v2/;https://licensedpackages.chocolatey.org/api/v2/
+
+chocolatey_features:
+  - showNonElevatedWarnings: disabled
+  - useBackgroundService: enabled
+  - useBackgroundServiceWithNonAdministratorsOnly: enabled
+  - allowBackgroundServiceUninstallsFromUserInstallsOnly: enabled
+  - excludeChocolateyPackagesDuringUpgradeAll: enabled
+
+chocolatey_config:
+  - cacheLocation: C:\ProgramData\chocolatey\choco-cache
+  - commandExecutionTimeoutSeconds: 14400
+  - backgroundServiceAllowedCommands: install,upgrade,uninstall
+  # - upgradeAllExceptions: nexus-repository,jenkins,dotnet-aspnetcoremodule-v2,dotnet-6.0-runtime,dotnet-6.0-aspnetruntime

@@ -1,0 +1,5 @@
+---
+ccm_hostname: "{{ ccm_fqdn | mandatory }}"
+client_salt: "{{ ccm_client_salt | default('') }}"
+service_salt: "{{ ccm_service_salt | default('') }}"
+...

@@ -1,0 +1,153 @@
+---
+# Installs MS SQL Express ~and SQL Server Management Studio (SSMS)~
+- name: Install SQL Server Express
+  chocolatey.chocolatey.win_chocolatey:
+    name: sql-server-express
+    state: present
+  become: true
+
+- name: Add Firewall Exception for CCM to Database
+  community.windows.win_firewall_rule:
+    name: CCM - SQL Service
+    action: allow
+    description: Allow inbound traffic from CCM to the database
+    localport: "1433"
+    protocol: tcp
+
+- name: Add Firewall Exception for SQL Server Browser to Database
+  community.windows.win_firewall_rule:
+    name: CCM - SQL Browser
+    action: allow
+    description: Allow inbound traffic from CCM to the database
+    localport: "1434"
+    protocol: udp
+
+- name: Set SQL LoginMode to allow SQL Logins and Enable Protocols
+  ansible.windows.win_powershell:
+    script: |
+      $Ansible.Changed = $false
+
+      $SqlString = (Get-ChildItem -Path 'HKLM:\Software\Microsoft\Microsoft SQL Server').Name |
+          Where-Object { $_ -like "HKEY_LOCAL_MACHINE\Software\Microsoft\Microsoft SQL Server\MSSQL*.SQLEXPRESS" }
+      $SqlVersion = $SqlString.Split("\") | Where-Object { $_ -like "MSSQL*.SQLEXPRESS" }
+
+      if ((Get-ItemProperty "HKLM:\Software\Microsoft\Microsoft SQL Server\$SqlVersion\MSSQLServer\" -Name LoginMode -ErrorAction SilentlyContinue).LoginMode -ne 2) {
+        New-ItemProperty "HKLM:\Software\Microsoft\Microsoft SQL Server\$SqlVersion\MSSQLServer\" -Name 'LoginMode' -Value 2 -Force
+        $Ansible.Changed = $true
+      }
+
+      Import-Module SQLPS
+      $Wmi = [Microsoft.SqlServer.Management.Smo.Wmi.ManagedComputer]::new()
+
+      foreach ($Protocol in @('Tcp', 'Np')) {
+        $Setting = $Wmi.GetSmoObject("ManagedComputer[@Name='$($env:ComputerName)']/ServerInstance[@Name='SQLEXPRESS']/ServerProtocol[@Name='$($Protocol)']")
+        if (-not $Setting.IsEnabled) {
+          $Setting.IsEnabled = $true
+          $Setting.Alter()
+          $Ansible.Changed = $true
+        }
+      }
+
+      if ($Ansible.Changed = $true) {
+        Restart-Service 'MSSQL$SQLEXPRESS'
+        Restart-Service 'SQLBrowser'
+      }
+
+- name: Start SQLBrowser Service
+  ansible.windows.win_service:
+    name: SQLBrowser
+    start_mode: auto
+    state: started
+
+- name: Setup Database
+  ansible.windows.win_powershell:
+    parameters:
+      LoginUser: "{{ database_username | default('ChocoUser') }}"
+      LoginPassword: "{{ database_password }}"
+    script: |
+      #requires -modules DbaTools
+      param(
+        [string]$LoginUser,
+        [string]$LoginPassword
+      )
+      $ErrorActionPreferece = "Stop"
+      $Ansible.Changed = $false
+
+      # For creating this database, we assume we're using a freshly set up SQLServerExpress instance
+      $SqlInstance = @{
+        SqlInstance = Connect-DbaInstance -SqlInstance "localhost\SQLEXPRESS" -TrustServerCertificate
+      }
+      $DbArgs = @{
+        Database = "ChocolateyManagement"
+      }
+      if (-not ($DB = Get-DbaDatabase @SqlInstance @DbArgs)) {
+        $DB = New-DbaDatabase @SqlInstance -Name $DbArgs.Database
+        $Ansible.Changed = $true
+      }
+
+      $Ansible.Result = @{
+        SqlInstance = $DB.SqlInstance
+        DatabaseName = $DB.Name
+      }
+
+      $LoginArgs = @{
+        Login = $LoginUser
+      }
+
+      if (-not ($Login = Get-DbaLogin @SqlInstance @LoginArgs)) {
+        $LoginArgs += @{
+          SecurePassword = $LoginPassword | ConvertTo-SecureString -AsPlainText -Force
+          DefaultDatabase = $DB.Name
+          PasswordExpirationEnabled = $false
+          PasswordPolicyEnforced = $false
+        }
+        $Login = New-DbaLogin @SqlInstance @LoginArgs
+        $Ansible.Changed = $true
+      } else {
+        $LoginArgs += @{
+          SecurePassword = $LoginPassword | ConvertTo-SecureString -AsPlainText -Force
+        }
+        $Login = Set-DbaLogin @SqlInstance @LoginArgs
+
+        if ($Login.PasswordChanged) {
+          $Ansible.Changed = $true
+        }
+      }
+
+      $UserArgs = @{
+        User = $LoginUser
+      }
+      if (-not ($User = Get-DbaDbUser @SqlInstance @DbArgs @UserArgs)) {
+        $User = New-DbaDbUser @SqlInstance @DbArgs -Username $UserArgs.User -Login $LoginArgs.Login
+        $Ansible.Changed = $true
+      }
+
+      foreach ($Role in @(
+        'db_datareader', 'db_datawriter', 'db_ddladmin'
+        # TODO: Check what database permissions are really required. May just grant CREATE TABLE?
+      )) {
+        if ($UserArgs.User -notin (Get-DbaDbRoleMember @SqlInstance @DbArgs -Role $Role).UserName) {
+          Add-DbaDbRoleMember @SqlInstance @DbArgs @UserArgs -Role $Role -Confirm:$false
+          $Ansible.Changed = $true
+        }
+      }
+
+      $Ansible.Result += @{
+        UserId = $Login.Name
+        UserPassword = $LoginPassword
+      }
+  register: _database_setup
+
+- name: Validate Connection String Information
+  ansible.builtin.assert:
+    that:
+      - _database_setup.result.SqlInstance is defined
+      - _database_setup.result.DatabaseName is defined
+      - _database_setup.result.UserId is defined
+      - _database_setup.result.UserPassword is defined
+    quiet: true
+
+- name: Set database_connection_string
+  ansible.builtin.set_fact:
+    database_connection_string: "server={{ _database_setup.result.SqlInstance }};database={{ _database_setup.result.DatabaseName }};User Id={{ _database_setup.result.UserId }};Password={{ _database_setup.result.UserPassword }}"
+...

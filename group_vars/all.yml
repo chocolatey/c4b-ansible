@@ -1,0 +1,55 @@
+---
+database_password: "{{ lookup('ansible.builtin.password', 'credentials/database_password', chars=['ascii_letters', 'digits'], length=64, seed=(inventory_hostname + 'databasepw')) }}"
+
+ccm_fqdn: "{{ lookup('file', 'credentials/ccm_fqdn') | mandatory }}"  # Should be pulled from the certificate in use, or prompted for if a wildcard is provided
+ccm_port: 443
+ccm_service_port: 24020
+ccm_password: "{{ lookup('ansible.builtin.password', 'credentials/ccm_password', chars=['ascii_letters', 'digits', '!%()*+,-./<=>?@[]^_'], length=32, seed=(inventory_hostname + 'ccmpw')) }}"
+ccm_client_salt: "{{ lookup('ansible.builtin.password', 'credentials/ccm_client_salt', chars=['ascii_letters', 'digits', '!%()*+,-./<=>?@[]^_'], length=64, seed=(inventory_hostname + 'ccmcs')) }}"
+ccm_service_salt: "{{ lookup('ansible.builtin.password', 'credentials/ccm_service_salt', chars=['ascii_letters', 'digits', '!%()*+,-./<=>?@[]^_'], length=64, seed=(inventory_hostname + 'ccmss')) }}"
+ccm_encryption_password: "{{ lookup('ansible.builtin.password', 'credentials/ccm_encryption_password', chars=['ascii_letters', 'digits', '!%()*+,-./<=>?@[]^_'], length=64, seed=(inventory_hostname + 'ccmep')) }}"
+
+nexus_fqdn: "{{ ccm_fqdn }}"
+nexus_port: 8443
+nexus_password: "{{ lookup('ansible.builtin.password', 'credentials/nexus_password', chars=['ascii_letters', 'digits', '!%()*+,-./<=>?@[]^_'], length=32, seed=(inventory_hostname + 'jenkinspass')) }}"
+
+chocouser_password: "{{ lookup('ansible.builtin.password', 'credentials/chocouser_password', chars=['ascii_letters', 'digits', '!%()*+,-./<=>?@[]^_'], length=32, seed=(inventory_hostname + 'chocouserpass')) }}"
+packageuser_password:  "{{ lookup('ansible.builtin.password', 'credentials/packageuser_password', chars=['ascii_letters', 'digits', '!%()*+,-./<=>?@[]^_'], length=32, seed=(inventory_hostname + 'packageuserpass')) }}"
+
+jenkins_fqdn: "{{ ccm_fqdn }}"
+jenkins_port: 7443
+jenkins_password: "{{ lookup('ansible.builtin.password', 'credentials/jenkins_password', chars=['ascii_letters', 'digits', '!%()*+,-./<=>?@[]^_'], length=32, seed=(inventory_hostname + 'nexuspass')) }}"
+
+# Packages to Install
+java_package_id: temurin11jre
+java_package_query: "packages[?name==`{{ java_package_id }}`].version | [0]"
+java_package_version: "{{ lookup('file', 'chocolatey.json') | from_json | json_query(java_package_query) | default(omit) }}"
+
+# Packages to Internalize
+# internalize_packages:
+# - 1password
+# - 7zip
+# - adobereader
+# - azcopy
+# - azure-cli
+# - firefox
+# - gimp
+# - git
+# - googlechrome
+# - googledrive
+# - javaruntime
+# - microsoft-edge
+# - microsoft-teams
+# - notepadplusplus
+# - office365proplus
+# - onedrive
+# - powershell
+# - putty
+# - skype
+# - slack
+# - sysinternals
+# - vlc
+# - vscode
+# - vscode-powershell
+# - zoom
+...

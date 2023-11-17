@@ -1,0 +1,443 @@
+---
+- name: Add FQDN to Hostsfile
+  community.windows.win_hosts:
+    canonical_name: "{{ nexus_fqdn }}"
+    ip_address: 127.0.0.1
+
+- name: Install Nexus
+  chocolatey.chocolatey.win_chocolatey:
+    name: nexus-repository
+    state: latest
+    package_params:
+      - "/PORT={{ nexus_port | default(8081) }}"
+
+- name: Set Nexus Certificate
+  when: certificate_path is defined
+  block:
+    - name: Ensure Directory
+      ansible.windows.win_file:
+        path: C:\choco-setup\
+        state: directory
+
+    - name: Copy Certificate to Disk
+      ansible.windows.win_copy:
+        src: "{{ certificate_path }}"
+        dest: C:\choco-setup\nexus.pfx
+      register: certificate_copy
+
+    - name: Install Nexus Certificate
+      when: certificate_copy.changed
+      ansible.windows.win_powershell:
+        parameters:
+          NexusPort: "{{ nexus_port | default(8081) }}"
+          CertificatePath: "{{ certificate_copy.dest }}"
+          CertificatePassword: "{{ certificate_password }}"
+        script: |
+          param($NexusPort, $CertificatePath, $CertificatePassword)
+
+          # Check that the certificate and password match
+          try {
+            $null = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+              $CertificatePath,
+              $CertificatePassword,
+              32  # EphemeralKeySet
+            )
+          } catch {
+            $Ansible.Result = "Certificate and Password do not match"
+            $Ansible.Failed = $true
+          }
+
+          # Generate the Keystore file
+          $KeyStore = "C:\ProgramData\nexus\etc\ssl\keystore.jks"
+          $KeyTool = "C:\ProgramData\nexus\jre\bin\keytool.exe"
+          $XmlPath = 'C:\ProgramData\nexus\etc\jetty\jetty-https.xml'
+          $Passkey = '{{ lookup('ansible.builtin.password', '/dev/null', chars=['ascii_letters', 'digits'], length=32, seed=certificate_password+inventory_hostname) }}'
+
+          if (Test-Path $KeyStore) {
+            Remove-Item $KeyStore -Force
+          }
+
+          $CurrentAlias = ($($CertificatePassword | & $KeyTool -list -v -storetype PKCS12 -keystore $CertificatePath) -match "^Alias.*")[0].Split(':')[1].Trim()
+
+          & $KeyTool -importkeystore -srckeystore $CertificatePath -srcstoretype PKCS12 -srcstorepass $CertificatePassword -destkeystore $KeyStore -deststoretype JKS -alias $currentAlias -destalias jetty -deststorepass $passkey
+          & $KeyTool -keypasswd -keystore $KeyStore -alias jetty -storepass $passkey -keypass $CertificatePassword -new $passkey
+
+          # Update the Jetty XML Configuration
+          [xml]$Xml = Get-Content -Path $XmlPath
+          $Xml.Configure.New.Where{
+            $_.id -match 'ssl'
+          }.Set.Where{
+            $_.name -match 'password'
+          }.ForEach{
+            $_.InnerText = $passkey
+          }
+          $Xml.Save($XmlPath)
+
+          # Update the Nexus Configuration
+          $configPath = "C:\ProgramData\sonatype-work\nexus3\etc\nexus.properties"
+          (Get-Content $configPath) | Where-Object {$_ -notmatch "application-port-ssl="} | Set-Content $configPath
+
+          @(
+            'jetty.https.stsMaxAge=-1'
+            "application-port-ssl=$NexusPort"
+            'nexus-args=${jetty.etc}/jetty.xml,${jetty.etc}/jetty-https.xml,${jetty.etc}/jetty-requestlog.xml'
+          ).ForEach{
+            if ((Get-Content -Raw $configPath) -notmatch [regex]::Escape($_)) {
+              $_ | Add-Content -Path $configPath
+            }
+          }
+
+          if ((Get-Service nexus).Status -eq 'Running') {
+            Restart-Service nexus
+          } else {
+            Start-Service nexus
+          }
+
+- name: Wait for Nexus
+  ansible.windows.win_wait_for:
+    delay: 10
+    host: localhost
+    port: "{{ nexus_port }}"
+
+- name: Add Firewall Exception for Nexus
+  community.windows.win_firewall_rule:
+    name: Nexus
+    action: allow
+    description: Allow inbound traffic to the Nexus service
+    localport: "{{ nexus_port | default(8081) }}"
+    protocol: tcp
+
+- name: Check for First Run
+  ansible.windows.win_stat:
+    path: "C:\\ProgramData\\sonatype-work\\nexus3\\admin.password"
+  register: _firstrun_file
+
+- name: Get Admin Credentials for Nexus
+  when: _firstrun_file.stat.exists
+  block:
+    - name: Get Default Nexus Password
+      ansible.windows.win_powershell:
+        script: |
+          $Ansible.Result = if (Test-Path C:\ProgramData\sonatype-work\nexus3\admin.password) {
+            "$(Get-Content C:\ProgramData\sonatype-work\nexus3\admin.password)"
+          } else {
+            "{{ nexus_password }}"
+          }
+      register: _token
+
+    - name: Set Nexus Password using Default Password
+      ansible.windows.win_uri:
+        url: "https://{{ nexus_fqdn | default('localhost') }}:{{ nexus_port | default(8081) }}/service/rest/v1/security/users/admin/change-password"
+        method: PUT
+        headers:
+          Content-Type: "text/plain"
+          Authorization: "Basic {{ (('admin:' + (_token.result | string()))) | b64encode }}"
+        body: "{{ nexus_password }}"
+        status_code: 204
+      no_log: false  # Temp
+
+    - name: Test Nexus Credential
+      ansible.windows.win_uri:
+        url: "https://{{ nexus_fqdn | default('localhost') }}:{{ nexus_port | default(8081) }}/service/rest/v1/status"
+        method: GET
+        headers:
+          Authorization: "Basic {{ (('admin:' + (nexus_password | string()))) | b64encode }}"
+      register: _credential_test
+
+    - name: Remove Default Password File
+      ansible.windows.win_file:
+        path: "C:\\ProgramData\\sonatype-work\\nexus3\\admin.password"
+        state: absent
+      when: _credential_test.status_code == 200
+
+- name: Set Credentials for Nexus
+  ansible.builtin.set_fact:
+    _baseurl: "https://{{ nexus_fqdn | default('localhost') }}:{{ nexus_port | default(8081) }}/service/rest/v1"
+    _base64_token: "{{ (('admin:' + (nexus_password | string()))) | b64encode }}"
+
+- name: Disable Anonymous Authentication
+  ansible.windows.win_uri:
+    url: "{{ _baseurl }}/security/anonymous"
+    method: PUT
+    headers:
+      Content-Type: "application/json"
+      Authorization: "Basic {{ _base64_token }}"
+    body:
+      enabled: false
+      userId: anonymous
+      realmName: NexusAuthorizingRealm
+
+- name: Enable Nuget Api-Key Realm
+  block:
+    - name: Get Current Realms
+      ansible.windows.win_uri:
+        url: "{{ _baseurl }}/security/realms/active"
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Basic {{ _base64_token }}"
+        return_content: true
+      register: _current_realms
+
+    - name: Enable Nuget API Key Realm
+      ansible.windows.win_uri:
+        url: "{{ _baseurl }}/security/realms/active"
+        method: PUT
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Basic {{ _base64_token }}"
+        body: "{{ ['NuGetApiKey'] + _current_realms.json | list }}"
+        status_code: 204
+      when: "'NuGetApiKey' not in _current_realms.json | list"
+
+- name: Create Roles
+  block:
+    - name: Get Existing Roles
+      ansible.windows.win_uri:
+        url: "{{ _baseurl }}/security/roles"
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Basic {{ _base64_token }}"
+        return_content: true
+        status_code:
+          - 200  # It may exist
+          - 404  # It may not exist
+      register: _existing_roles
+
+    - name: Create Role
+      ansible.windows.win_uri:
+        url: "{{ _baseurl }}/security/roles"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Basic {{ _base64_token }}"
+        body:
+          id: "{{ item.name }}"
+          name: "{{ item.name }}"
+          description: "{{ item.description }}"
+          privileges: "{{ item.privileges }}"
+          roles: []
+      when: item.name not in _existing_roles.json | map(attribute='id') | list
+      loop:
+        - name: chocoweb
+          description: Role for web enabled choco clients
+          privileges:
+            - nx-repository-view-nuget-*-browse
+            - nx-repository-view-nuget-*-read
+            - nx-repository-view-raw-*-read
+            - nx-repository-view-raw-*-browse
+        - name: package-uploader
+          description: Role allowed to push and list packages
+          privileges:
+            - nx-repository-view-nuget-*-edit
+            - nx-repository-view-nuget-*-read
+            - nx-apikey-all
+
+- name: Create Users
+  block:
+    - name: Get Existing Users
+      ansible.windows.win_uri:
+        url: "{{ _baseurl }}/security/users"
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Basic {{ _base64_token }}"
+        return_content: true
+      register: _existing_users
+
+    - name: Create User
+      ansible.windows.win_uri:
+        url: "{{ _baseurl }}/security/users"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Basic {{ _base64_token }}"
+        body: "{{ item }}"
+      loop:
+        - userId: chocouser
+          firstName: Choco
+          lastName: Webuser
+          emailAddress: chocouser@{{ inventory_hostname }}
+          password: "{{ chocouser_password }}"
+          status: Active
+          roles: ['chocoweb']
+
+        - userId: chocopackager
+          firstName: Chocolatey
+          lastName: Packager
+          emailAddress: chocopackager@{{ inventory_hostname }}
+          password: "{{ packageuser_password }}"
+          status: Active
+          roles: ['package-uploader']
+      when: item.userId not in _existing_users.json | map(attribute='userId') | list
+      no_log: true
+
+- name: Create API Key for chocopackager
+  block:
+    - name: Get User Token
+      ansible.windows.win_uri:
+        url: "https://{{ nexus_fqdn }}:{{ nexus_port | default(8081) }}/service/extdirect"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Basic {{ (('chocopackager:' + (packageuser_password | string()))) | b64encode }}"
+        body:
+          action: rapture_Security
+          method: authenticationToken
+          data: ["{{ 'chocopackager' | b64encode }}", "{{ packageuser_password | b64encode }}"]
+          type: rpc
+          tid: 16
+        return_content: true
+      register: _packager_usertoken
+
+    - name: Set Facts for Api-Key retrieval
+      ansible.builtin.set_fact:
+        _packager_usertoken: "{{ _packager_usertoken.json.result.data | b64encode }}"
+        _dc_string: "1625090000000"
+
+    - name: Get NuGet API-Key for chocopackager
+      ansible.windows.win_uri:
+        url: "https://{{ nexus_fqdn }}:{{ nexus_port | default(8081) }}/service/rest/internal/nuget-api-key?authToken={{ _packager_usertoken }}&_dc={{ _dc_string }}"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Basic {{ (('chocopackager:' + (packageuser_password | string()))) | b64encode }}"
+        return_content: true
+      register: _packager_apikey
+
+    - name: Set Credential File
+      ansible.builtin.copy:
+        dest: credentials/nexus_apikey
+        content: "{{ _packager_apikey.json.apiKey }}"
+      delegate_to: localhost
+
+- name: Set up Repositories
+  block:
+    - name: Get Existing Repositories
+      ansible.windows.win_uri:
+        url: "{{ _baseurl }}/repositories"
+        method: GET
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Basic {{ _base64_token }}"
+        return_content: true
+      register: _existing_repositories
+
+    - name: Remove Default Repositories
+      ansible.windows.win_uri:
+        url: "{{ _baseurl }}/repositories/{{ item }}"
+        method: DELETE
+        headers:
+          Authorization: "Basic {{ _base64_token }}"
+        status_code: 204
+      loop:
+        - 'nuget-group'
+        - 'maven-snapshots'
+        - 'maven-central'
+        - 'nuget.org-proxy'
+        - 'maven-releases'
+        - 'nuget-hosted'
+        - 'maven-public'
+      when: item in _existing_repositories.json | default([]) | map(attribute='name') | list
+
+    - name: Calculate Required Repositories
+      ansible.builtin.set_fact:
+        _nexus_repositories: "{{ default_repositories + chocosetup if hostvars['localhost']['existing_packages']['files'] | length > 0 else default_repositories }}"
+      vars:
+        default_repositories:
+          - name: ChocolateyInternal
+            type: nuget
+          - name: ChocolateyTest
+            type: nuget
+          - name: choco-install
+            type: raw
+        chocosetup:
+          - name: ChocolateySetup
+            type: nuget
+
+    - name: Create Repositories
+      ansible.windows.win_uri:
+        url: "{{ _baseurl }}/repositories/{{ item.type }}/hosted"
+        method: POST
+        headers:
+          Content-Type: "application/json"
+          Authorization: "Basic {{ _base64_token }}"
+        body:
+          name: "{{ item.name }}"
+          online: true
+          storage:
+            blobStoreName: default
+            writePolicy: Allow
+            strictContentTypeValidation: true
+        status_code: 201
+      when: item.name not in _existing_repositories.json | default([]) | map(attribute='name') | list
+      loop: "{{ _nexus_repositories }}"
+
+- name: Install NexuShell
+  chocolatey.chocolatey.win_chocolatey:
+    name: NexuShell
+    state: present
+
+- name: Drop Install Scripts
+  ansible.windows.win_template:
+    src: templates/{{ item }}.ps1.j2
+    dest: C:\choco-setup\{{ item }}.ps1
+  loop:
+    - ClientSetup
+    - ChocolateyInstall
+
+- name: Populate Nexus Repositories
+  ansible.windows.win_powershell:
+    parameters:
+      BaseDirectory: 'C:\choco-setup'
+      RawFiles:
+        - ChocolateyInstall.ps1
+        - ClientSetup.ps1
+      Packages:
+        - chocolatey
+        - chocolatey.extension
+        - chocolateygui
+        - chocolateygui.extension
+        - chocolatey-agent
+        - chocolatey-compatibility.extension
+        - chocolatey-core.extension
+        - chocolatey-dotnetfx.extension
+        - dotnetfx
+        - KB2919355
+        - KB2919442
+    script: |
+      param($BaseDirectory, [string[]]$RawFiles, [string[]]$Packages)
+      $Credential = [PSCredential]::new("admin", ("{{ nexus_password }}" | ConvertTo-SecureString -AsPlainText -Force))
+      Connect-NexusServer -Hostname '{{ nexus_fqdn }}' -Sslport '{{ nexus_port }}' -Credential $Credential -UseSSL
+
+      $Ansible.Changed = $false
+      Set-Location $BaseDirectory
+
+      $ApiToken = (Get-NexusNuGetApiKey -Credential $Credential).apiKey
+
+      # Handle Chocolatey Packages
+      $Repo = @{RepositoryName = "ChocolateyInternal"}
+      $ExistingPackages = Get-NexusComponent @Repo
+      foreach ($Package in $Packages) {
+        $Path = @(Convert-Path "$BaseDirectory\$($Package).*.nupkg") -match "$($Package)\.\d"
+        if ($Package -notin $ExistingPackages.Name) {
+          if (-not $Path) {
+            choco download $Package --source="chocolatey,chocolatey.licensed"
+            $Path = @(Convert-Path "$BaseDirectory\$($Package).*.nupkg") -match "$($Package)\.\d"
+          }
+          $Ansible.Changed = $true
+          foreach ($Path in $Path) {
+            choco push $Path --source https://{{ nexus_fqdn }}:{{ nexus_port }}/repository/ChocolateyInternal/ --api-key $ApiToken
+          }
+        }
+      }
+
+      # Handle Raw Assets
+      $Repo.RepositoryName = "choco-install"
+      $ExistingRawFiles = Get-NexusComponent @Repo
+      foreach ($File in $RawFiles) {
+        $Path = Join-Path $BaseDirectory $File
+        if ($File -notin $ExistingRawFiles.Name -and (Test-Path $Path)) {
+          $Ansible.Changed = $true
+          New-NexusRawComponent @Repo -File $Path
+        }
+      }
+...
