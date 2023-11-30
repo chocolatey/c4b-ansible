@@ -1,4 +1,8 @@
 ---
 collections:
-  - chocolatey.chocolatey
+- name: ansible.windows
+  version: '>=1.5.0'  # win_powershell was added in this version
+- chocolatey.chocolatey
+- community.crypto
+- community.windows
 ...
