@@ -25,11 +25,16 @@ You should provide the following arguments:
 
 Finally, you can deploy the playbook as follows (using the example hosts file):
 
-`ansible-playbook ./c4b-environment.yml -i ./hosts.yml`
+```bash
+ansible-playbook ./c4b-environment.yml
+```
 
 You will be prompted for any values you have not provided in `--extra-vars` or another fashion. An example of passing a variable on the command-line is as follows:
 
-`ansible-playbook ./c4b-environment --extra-vars "license_path=/path/to/chocolatey.license.xml certificate_path=/path/to/certificate.pfx"`
+```bash
+ansible-playbook ./c4b-environment.yml \
+    --extra-vars "license_path=/path/to/chocolatey.license.xml certificate_path=/path/to/certificate.pfx"
+```
 
 You can also define variables in AWX, or within a file. For further details, see [Defining variables at runtime](https://docs.ansible.com/ansible/latest/playbook_guide/playbooks_variables.html#passing-variables-on-the-command-line).
 
