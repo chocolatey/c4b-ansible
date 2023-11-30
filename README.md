@@ -23,6 +23,13 @@ You should provide the following arguments:
 | certificate_path           | The PFX certificate to use for all HTTPS services. |
 | certificate_password       | The password for the PFX certificate.              |
 
+Depending on the way Ansible has been installed it might be required to install the collections used in this playbook.
+Use the following command to install the collections locally to this playbook:
+
+```bash
+ansible-galaxy collection install -r collections/requirements.yml -p collections
+```
+
 Finally, you can deploy the playbook as follows (using the example hosts file):
 
 `ansible-playbook ./c4b-environment.yml -i ./hosts.yml`
