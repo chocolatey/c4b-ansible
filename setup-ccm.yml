@@ -121,6 +121,16 @@
     choco_args:
       - "--package-parameters-sensitive='/ConnectionString:{{ database_connection_string }}'"
 
+# FUTURE look into using ansible.windows.win_acl when 2.2.0 is more readily available
+# It simplifies private key ACL management so you don't have to do all this mess.
+# - name: Grant read access to the private key for the Chocolatey Web AppPool
+#   ansible.windows.win_acl:
+#     path: Cert:\LocalMachine\TrustedPeople\{{ certificate_thumbprint }}
+#     user: IIS AppPool\ChocolateyCentralManagement
+#     type: allow
+#     state: present
+#     rights: Read
+
 - name: Set Chocolatey Central Management Web Certificate
   ansible.windows.win_powershell:
     parameters:
@@ -140,14 +150,52 @@
         }
 
         # Adjust permissions on the certificate
-        $KeyName = (Get-Item Cert:\LocalMachine\TrustedPeople\$CertificateThumbprint).PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName
-        $FullPath = Join-Path $env:ProgramData "\Microsoft\Crypto\RSA\MachineKeys\$($KeyName)"
-        if (Test-Path $FullPath) {
-          $Acl = Get-Acl $FullPath
-          $AccessRule = New-Object System.Security.AccessControl.FileSystemAccessRule("IIS AppPool\ChocolateyCentralManagement", "Read", "Allow")
-          $Acl.SetAccessRule($AccessRule)
-          Set-Acl $FullPath $Acl
-        } else {
+
+        # The PrivateKey property only works for RSA keys. To support ECDSA
+        # keys (and any future algos) we need to use the extension methods.
+        $cert = Get-Item Cert:\LocalMachine\TrustedPeople\$CertificateThumbprint
+
+        $key = $null
+        foreach ($keyMethod in @(
+          [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey
+          [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey
+        )) {
+            $key = $keyMethod.Invoke($cert)
+            if ($key) {
+              break
+            }
+        }
+        if (-not $key) {
+          $keyAlgoOid = $cert.PublicKey.Oid
+          $algoName = if ($keyAlgoOid.FriendlyName) { $keyAlgoOid.FriendlyName } else { $keyAlgoOid.Value }
+          Write-Error "Unknown certificate algorithm '$algoName', cannot set permissions." -ErrorAction Stop
+        }
+
+        # The location of the private key differs based on the provider used
+        # and how the key was imported.
+        $keyFound = $false
+        foreach ($keyLocation in @(
+          # CNG - Shared Private
+          "Microsoft\Crypto\Keys"
+          # CryptoAPI - Legacy Provider
+          "Microsoft\Crypto\RSA\MachineKeys"
+        )) {
+          $KeyPath = [System.IO.Path]::Combine($env:ProgramData, $keyLocation, $key.Key.UniqueName)
+          if (Test-Path -LiteralPath $KeyPath) {
+              $Acl = Get-Acl -LiteralPath $KeyPath
+              $AccessRule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+                "IIS AppPool\ChocolateyCentralManagement",
+                "Read",
+                "Allow")
+              $Acl.SetAccessRule($AccessRule)
+              Set-Acl $FullPath $Acl
+
+              $keyFound = $true
+              break
+          }
+        }
+
+        if (-not $keyFound) {
           Write-Error "Private Key may not be available for export. Ensure import was successful." -ErrorAction Stop
         }
 
