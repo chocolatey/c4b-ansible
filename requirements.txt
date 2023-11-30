@@ -1,5 +1,5 @@
--i https://pypi.org/simple
-passlib 1.7.4
-pywinrm>=0.2.2
+ansible-core>=2.14.0
+passlib
+pywinrm>=0.3.0  # Supports message encryption
 jmespath
 dnspython
