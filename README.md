@@ -32,7 +32,7 @@ ansible-playbook ./c4b-environment.yml
 You will be prompted for any values you have not provided in `--extra-vars` or another fashion. An example of passing a variable on the command-line is as follows:
 
 ```bash
-ansible-playbook ./c4b-environment \
+ansible-playbook ./c4b-environment.yml \
     --extra-vars "license_path=/path/to/chocolatey.license.xml certificate_path=/path/to/certificate.pfx"
 ```
 
